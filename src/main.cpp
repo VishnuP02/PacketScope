@@ -1,29 +1,42 @@
 #include <pcap.h>
 #include <iostream>
 
+void packetHandler(unsigned char* userData, const struct pcap_pkthdr* packetHeader, const unsigned char* packetData) {
+    static int packetCount = 0;
+    packetCount++;
+
+    std::cout << "Packet #" << packetCount
+              << " | Length: " << packetHeader->len
+              << " bytes"
+              << std::endl;
+}
+
 int main() {
     char errorBuffer[PCAP_ERRBUF_SIZE];
 
-    pcap_if_t* devices;
-    if (pcap_findalldevs(&devices, errorBuffer) == -1) {
-        std::cerr << "Error finding devices: " << errorBuffer << std::endl;
+    const char* device = "en0";
+
+    pcap_t* handle = pcap_open_live(
+        device,
+        BUFSIZ,
+        1,
+        1000,
+        errorBuffer
+    );
+
+    if (handle == nullptr) {
+        std::cerr << "Could not open device " << device << ": " << errorBuffer << std::endl;
         return 1;
     }
 
-    std::cout << "Available network interfaces:\n";
+    std::cout << "Capturing packets on interface: " << device << std::endl;
+    std::cout << "Press Ctrl+C to stop.\n";
 
-    int count = 0;
-    for (pcap_if_t* device = devices; device != nullptr; device = device->next) {
-        std::cout << ++count << ". " << device->name;
+    pcap_loop(handle, 10, packetHandler, nullptr);
 
-        if (device->description) {
-            std::cout << " - " << device->description;
-        }
+    pcap_close(handle);
 
-        std::cout << std::endl;
-    }
-
-    pcap_freealldevs(devices);
+    std::cout << "Capture complete." << std::endl;
 
     return 0;
 }
