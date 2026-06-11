@@ -1,5 +1,10 @@
 #include <pcap.h>
 #include <iostream>
+#include <map>
+#include <vector>
+#include <algorithm>
+#include <string>
+#include <fstream>
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 #include <netinet/if_ether.h>
@@ -18,6 +23,33 @@ struct TrafficStats {
 };
 
 TrafficStats stats;
+std::map<std::string, int> connectionCounts;
+std::ofstream logFile;
+std::string packetFilter = "all";
+
+void logPacket(const std::string& message) {
+    if (logFile.is_open()) {
+        logFile << message << std::endl;
+    }
+}
+
+void trackConnection(const std::string& sourceIp, const std::string& destinationIp) {
+    std::string connection = sourceIp + " -> " + destinationIp;
+    connectionCounts[connection]++;
+}
+
+bool shouldDisplayType(const std::string& type) {
+    return packetFilter == "all" || packetFilter == type;
+}
+
+bool shouldDisplayProtocol(const std::string& protocol) {
+    return packetFilter == "all" || packetFilter == protocol;
+}
+
+void processOutput(const std::string& output) {
+    std::cout << output << std::endl;
+    logPacket(output);
+}
 
 void packetHandler(unsigned char* userData,
                    const struct pcap_pkthdr* packetHeader,
@@ -42,33 +74,44 @@ void packetHandler(unsigned char* userData,
             reinterpret_cast<const struct ip*>(
                 packetData + sizeof(struct ether_header));
 
-        std::cout << "Packet #" << stats.totalPackets
-                  << " | Length: " << packetHeader->len << " bytes"
-                  << " | Type: IPv4"
-                  << " | Source IP: " << inet_ntoa(ipHeader->ip_src)
-                  << " | Destination IP: " << inet_ntoa(ipHeader->ip_dst)
-                  << " | Protocol: ";
+        std::string sourceIp = inet_ntoa(ipHeader->ip_src);
+        std::string destinationIp = inet_ntoa(ipHeader->ip_dst);
+        std::string protocolName;
+
+        trackConnection(sourceIp, destinationIp);
 
         switch (ipHeader->ip_p) {
             case IPPROTO_TCP:
                 stats.tcpPackets++;
-                std::cout << "TCP";
+                protocolName = "tcp";
                 break;
             case IPPROTO_UDP:
                 stats.udpPackets++;
-                std::cout << "UDP";
+                protocolName = "udp";
                 break;
             case IPPROTO_ICMP:
                 stats.icmpPackets++;
-                std::cout << "ICMP";
+                protocolName = "icmp";
                 break;
             default:
                 stats.otherPackets++;
-                std::cout << "Other";
+                protocolName = "other";
                 break;
         }
 
-        std::cout << std::endl;
+        if (!shouldDisplayType("ipv4") && !shouldDisplayProtocol(protocolName)) {
+            return;
+        }
+
+        std::string output =
+            "Packet #" + std::to_string(stats.totalPackets) +
+            " | Length: " + std::to_string(packetHeader->len) + " bytes" +
+            " | Type: IPv4" +
+            " | Source IP: " + sourceIp +
+            " | Destination IP: " + destinationIp +
+            " | Protocol: " + protocolName;
+
+        processOutput(output);
     }
     else if (etherType == ETHERTYPE_IPV6) {
         stats.ipv6Packets++;
@@ -83,41 +126,58 @@ void packetHandler(unsigned char* userData,
         inet_ntop(AF_INET6, &(ip6Header->ip6_src), src, INET6_ADDRSTRLEN);
         inet_ntop(AF_INET6, &(ip6Header->ip6_dst), dst, INET6_ADDRSTRLEN);
 
-        std::cout << "Packet #" << stats.totalPackets
-                  << " | Length: " << packetHeader->len << " bytes"
-                  << " | Type: IPv6"
-                  << " | Source IP: " << src
-                  << " | Destination IP: " << dst
-                  << " | Protocol: ";
+        std::string sourceIp = src;
+        std::string destinationIp = dst;
+        std::string protocolName;
+
+        trackConnection(sourceIp, destinationIp);
 
         switch (ip6Header->ip6_nxt) {
             case IPPROTO_TCP:
                 stats.tcpPackets++;
-                std::cout << "TCP";
+                protocolName = "tcp";
                 break;
             case IPPROTO_UDP:
                 stats.udpPackets++;
-                std::cout << "UDP";
+                protocolName = "udp";
                 break;
             case IPPROTO_ICMPV6:
                 stats.icmpv6Packets++;
-                std::cout << "ICMPv6";
+                protocolName = "icmpv6";
                 break;
             default:
                 stats.otherPackets++;
-                std::cout << "Other";
+                protocolName = "other";
                 break;
         }
 
-        std::cout << std::endl;
+        if (!shouldDisplayType("ipv6") && !shouldDisplayProtocol(protocolName)) {
+            return;
+        }
+
+        std::string output =
+            "Packet #" + std::to_string(stats.totalPackets) +
+            " | Length: " + std::to_string(packetHeader->len) + " bytes" +
+            " | Type: IPv6" +
+            " | Source IP: " + sourceIp +
+            " | Destination IP: " + destinationIp +
+            " | Protocol: " + protocolName;
+
+        processOutput(output);
     }
     else {
         stats.otherPackets++;
 
-        std::cout << "Packet #" << stats.totalPackets
-                  << " | Length: " << packetHeader->len
-                  << " bytes | Non-IP packet"
-                  << std::endl;
+        if (!shouldDisplayProtocol("other")) {
+            return;
+        }
+
+        std::string output =
+            "Packet #" + std::to_string(stats.totalPackets) +
+            " | Length: " + std::to_string(packetHeader->len) +
+            " bytes | Non-IP packet";
+
+        processOutput(output);
     }
 }
 
@@ -130,7 +190,8 @@ void printTrafficSummary() {
     }
 
     std::cout << "\n========== Traffic Summary ==========" << std::endl;
-    std::cout << "Total Packets: " << stats.totalPackets << std::endl;
+    std::cout << "Filter: " << packetFilter << std::endl;
+    std::cout << "Total Packets Captured: " << stats.totalPackets << std::endl;
     std::cout << "IPv4 Packets: " << stats.ipv4Packets << std::endl;
     std::cout << "IPv6 Packets: " << stats.ipv6Packets << std::endl;
     std::cout << "TCP Packets: " << stats.tcpPackets << std::endl;
@@ -143,9 +204,66 @@ void printTrafficSummary() {
     std::cout << "=====================================" << std::endl;
 }
 
-int main() {
+void printTopConnections() {
+    std::vector<std::pair<std::string, int>> connections(
+        connectionCounts.begin(),
+        connectionCounts.end()
+    );
+
+    std::sort(
+        connections.begin(),
+        connections.end(),
+        [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        }
+    );
+
+    std::cout << "\n========== Top Connections ==========" << std::endl;
+
+    if (connections.empty()) {
+        std::cout << "No IP connections captured." << std::endl;
+    }
+    else {
+        int limit = std::min(5, static_cast<int>(connections.size()));
+
+        for (int i = 0; i < limit; i++) {
+            std::cout << i + 1 << ". "
+                      << connections[i].first
+                      << " | Packets: "
+                      << connections[i].second
+                      << std::endl;
+        }
+    }
+
+    std::cout << "=====================================" << std::endl;
+}
+
+void printUsage() {
+    std::cout << "Usage: sudo ./packetscope [filter]" << std::endl;
+    std::cout << "Available filters: all, tcp, udp, icmp, icmpv6, ipv4, ipv6, other" << std::endl;
+}
+
+int main(int argc, char* argv[]) {
     char errorBuffer[PCAP_ERRBUF_SIZE];
     const char* device = "en0";
+
+    if (argc > 1) {
+        packetFilter = argv[1];
+    }
+
+    if (packetFilter != "all" &&
+        packetFilter != "tcp" &&
+        packetFilter != "udp" &&
+        packetFilter != "icmp" &&
+        packetFilter != "icmpv6" &&
+        packetFilter != "ipv4" &&
+        packetFilter != "ipv6" &&
+        packetFilter != "other") {
+        printUsage();
+        return 1;
+    }
+
+    logFile.open("capture.log");
 
     pcap_t* handle = pcap_open_live(
         device,
@@ -166,15 +284,22 @@ int main() {
 
     std::cout << "PacketScope - Live Network Traffic Analyzer" << std::endl;
     std::cout << "Capturing packets on interface: " << device << std::endl;
-    std::cout << "Capturing 50 packets...\n" << std::endl;
+    std::cout << "Active filter: " << packetFilter << std::endl;
+    std::cout << "Logging packets to capture.log" << std::endl;
+    std::cout << "Capturing 100 packets...\n" << std::endl;
 
-    pcap_loop(handle, 50, packetHandler, nullptr);
+    pcap_loop(handle, 100, packetHandler, nullptr);
 
     pcap_close(handle);
 
     std::cout << "\nCapture complete." << std::endl;
 
     printTrafficSummary();
+    printTopConnections();
+
+    if (logFile.is_open()) {
+        logFile.close();
+    }
 
     return 0;
 }
