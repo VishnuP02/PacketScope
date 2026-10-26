@@ -1,305 +1,160 @@
-#include <pcap.h>
-#include <iostream>
-#include <map>
-#include <vector>
-#include <algorithm>
-#include <string>
+#include <csignal>
+#include <cstdlib>
 #include <fstream>
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
-#include <netinet/if_ether.h>
-#include <arpa/inet.h>
+#include <iostream>
+#include <string>
 
-struct TrafficStats {
-    int totalPackets = 0;
-    int ipv4Packets = 0;
-    int ipv6Packets = 0;
-    int tcpPackets = 0;
-    int udpPackets = 0;
-    int icmpPackets = 0;
-    int icmpv6Packets = 0;
-    int otherPackets = 0;
-    long totalBytes = 0;
-};
+#include <pcap/pcap.h>
 
-TrafficStats stats;
-std::map<std::string, int> connectionCounts;
-std::ofstream logFile;
-std::string packetFilter = "all";
+#include "packetscope/capture.hpp"
 
-void logPacket(const std::string& message) {
-    if (logFile.is_open()) {
-        logFile << message << std::endl;
-    }
+namespace {
+
+volatile std::sig_atomic_t g_stop = 0;
+
+void on_signal(int) { g_stop = 1; }
+
+void print_usage() {
+    std::cout << "Usage: packetscope [filter] [options]\n"
+                 "  filter        what to print: all, tcp, udp, icmp, icmpv6, ipv4, ipv6, other (default all)\n"
+                 "Options:\n"
+                 "  -i <iface>    capture live from this interface (default: first active non-loopback)\n"
+                 "  -r <file>     read packets from a .pcap file instead of a live interface\n"
+                 "  -c <count>    stop after this many packets (default 100, 0 = no limit)\n"
+                 "  -b <bpf>      libpcap capture filter, e.g. \"tcp port 443\"\n"
+                 "  -o <file>     log printed packets to this file (default capture.log, 'none' to disable)\n"
+                 "  -t <n>        port-scan alert threshold in distinct ports (default 20, 0 disables)\n"
+                 "  -h            show this help\n"
+                 "Live capture usually needs root: sudo ./packetscope\n";
 }
 
-void trackConnection(const std::string& sourceIp, const std::string& destinationIp) {
-    std::string connection = sourceIp + " -> " + destinationIp;
-    connectionCounts[connection]++;
-}
-
-bool shouldDisplayType(const std::string& type) {
-    return packetFilter == "all" || packetFilter == type;
-}
-
-bool shouldDisplayProtocol(const std::string& protocol) {
-    return packetFilter == "all" || packetFilter == protocol;
-}
-
-void processOutput(const std::string& output) {
-    std::cout << output << std::endl;
-    logPacket(output);
-}
-
-void packetHandler(unsigned char* userData,
-                   const struct pcap_pkthdr* packetHeader,
-                   const unsigned char* packetData) {
-    stats.totalPackets++;
-    stats.totalBytes += packetHeader->len;
-
-    if (packetHeader->len < sizeof(struct ether_header) + sizeof(struct ip)) {
-        stats.otherPackets++;
-        return;
-    }
-
-    const struct ether_header* ethernetHeader =
-        reinterpret_cast<const struct ether_header*>(packetData);
-
-    uint16_t etherType = ntohs(ethernetHeader->ether_type);
-
-    if (etherType == ETHERTYPE_IP) {
-        stats.ipv4Packets++;
-
-        const struct ip* ipHeader =
-            reinterpret_cast<const struct ip*>(
-                packetData + sizeof(struct ether_header));
-
-        std::string sourceIp = inet_ntoa(ipHeader->ip_src);
-        std::string destinationIp = inet_ntoa(ipHeader->ip_dst);
-        std::string protocolName;
-
-        trackConnection(sourceIp, destinationIp);
-
-        switch (ipHeader->ip_p) {
-            case IPPROTO_TCP:
-                stats.tcpPackets++;
-                protocolName = "tcp";
+std::string default_device() {
+    pcap_if_t* devices = nullptr;
+    char err[PCAP_ERRBUF_SIZE];
+    std::string chosen;
+    if (pcap_findalldevs(&devices, err) == 0) {
+        for (pcap_if_t* d = devices; d != nullptr; d = d->next) {
+            const bool loopback = (d->flags & PCAP_IF_LOOPBACK) != 0;
+            const bool up = (d->flags & PCAP_IF_UP) != 0;
+            if (!loopback && up) {
+                chosen = d->name;
                 break;
-            case IPPROTO_UDP:
-                stats.udpPackets++;
-                protocolName = "udp";
-                break;
-            case IPPROTO_ICMP:
-                stats.icmpPackets++;
-                protocolName = "icmp";
-                break;
-            default:
-                stats.otherPackets++;
-                protocolName = "other";
-                break;
+            }
         }
-
-        if (!shouldDisplayType("ipv4") && !shouldDisplayProtocol(protocolName)) {
-            return;
-        }
-
-        std::string output =
-            "Packet #" + std::to_string(stats.totalPackets) +
-            " | Length: " + std::to_string(packetHeader->len) + " bytes" +
-            " | Type: IPv4" +
-            " | Source IP: " + sourceIp +
-            " | Destination IP: " + destinationIp +
-            " | Protocol: " + protocolName;
-
-        processOutput(output);
+        pcap_freealldevs(devices);
     }
-    else if (etherType == ETHERTYPE_IPV6) {
-        stats.ipv6Packets++;
-
-        const struct ip6_hdr* ip6Header =
-            reinterpret_cast<const struct ip6_hdr*>(
-                packetData + sizeof(struct ether_header));
-
-        char src[INET6_ADDRSTRLEN];
-        char dst[INET6_ADDRSTRLEN];
-
-        inet_ntop(AF_INET6, &(ip6Header->ip6_src), src, INET6_ADDRSTRLEN);
-        inet_ntop(AF_INET6, &(ip6Header->ip6_dst), dst, INET6_ADDRSTRLEN);
-
-        std::string sourceIp = src;
-        std::string destinationIp = dst;
-        std::string protocolName;
-
-        trackConnection(sourceIp, destinationIp);
-
-        switch (ip6Header->ip6_nxt) {
-            case IPPROTO_TCP:
-                stats.tcpPackets++;
-                protocolName = "tcp";
-                break;
-            case IPPROTO_UDP:
-                stats.udpPackets++;
-                protocolName = "udp";
-                break;
-            case IPPROTO_ICMPV6:
-                stats.icmpv6Packets++;
-                protocolName = "icmpv6";
-                break;
-            default:
-                stats.otherPackets++;
-                protocolName = "other";
-                break;
-        }
-
-        if (!shouldDisplayType("ipv6") && !shouldDisplayProtocol(protocolName)) {
-            return;
-        }
-
-        std::string output =
-            "Packet #" + std::to_string(stats.totalPackets) +
-            " | Length: " + std::to_string(packetHeader->len) + " bytes" +
-            " | Type: IPv6" +
-            " | Source IP: " + sourceIp +
-            " | Destination IP: " + destinationIp +
-            " | Protocol: " + protocolName;
-
-        processOutput(output);
-    }
-    else {
-        stats.otherPackets++;
-
-        if (!shouldDisplayProtocol("other")) {
-            return;
-        }
-
-        std::string output =
-            "Packet #" + std::to_string(stats.totalPackets) +
-            " | Length: " + std::to_string(packetHeader->len) +
-            " bytes | Non-IP packet";
-
-        processOutput(output);
-    }
+    return chosen.empty() ? "en0" : chosen;
 }
 
-void printTrafficSummary() {
-    double averagePacketSize = 0.0;
-
-    if (stats.totalPackets > 0) {
-        averagePacketSize =
-            static_cast<double>(stats.totalBytes) / stats.totalPackets;
-    }
-
-    std::cout << "\n========== Traffic Summary ==========" << std::endl;
-    std::cout << "Filter: " << packetFilter << std::endl;
-    std::cout << "Total Packets Captured: " << stats.totalPackets << std::endl;
-    std::cout << "IPv4 Packets: " << stats.ipv4Packets << std::endl;
-    std::cout << "IPv6 Packets: " << stats.ipv6Packets << std::endl;
-    std::cout << "TCP Packets: " << stats.tcpPackets << std::endl;
-    std::cout << "UDP Packets: " << stats.udpPackets << std::endl;
-    std::cout << "ICMP Packets: " << stats.icmpPackets << std::endl;
-    std::cout << "ICMPv6 Packets: " << stats.icmpv6Packets << std::endl;
-    std::cout << "Other Packets: " << stats.otherPackets << std::endl;
-    std::cout << "Total Bytes: " << stats.totalBytes << std::endl;
-    std::cout << "Average Packet Size: " << averagePacketSize << " bytes" << std::endl;
-    std::cout << "=====================================" << std::endl;
-}
-
-void printTopConnections() {
-    std::vector<std::pair<std::string, int>> connections(
-        connectionCounts.begin(),
-        connectionCounts.end()
-    );
-
-    std::sort(
-        connections.begin(),
-        connections.end(),
-        [](const auto& a, const auto& b) {
-            return a.second > b.second;
-        }
-    );
-
-    std::cout << "\n========== Top Connections ==========" << std::endl;
-
-    if (connections.empty()) {
-        std::cout << "No IP connections captured." << std::endl;
-    }
-    else {
-        int limit = std::min(5, static_cast<int>(connections.size()));
-
-        for (int i = 0; i < limit; i++) {
-            std::cout << i + 1 << ". "
-                      << connections[i].first
-                      << " | Packets: "
-                      << connections[i].second
-                      << std::endl;
-        }
-    }
-
-    std::cout << "=====================================" << std::endl;
-}
-
-void printUsage() {
-    std::cout << "Usage: sudo ./packetscope [filter]" << std::endl;
-    std::cout << "Available filters: all, tcp, udp, icmp, icmpv6, ipv4, ipv6, other" << std::endl;
-}
+}  // namespace
 
 int main(int argc, char* argv[]) {
-    char errorBuffer[PCAP_ERRBUF_SIZE];
-    const char* device = "en0";
+    std::string filter_name = "all";
+    std::string device;
+    std::string read_file;
+    std::string log_path = "capture.log";
+    ps::CaptureOptions options;
+    std::size_t scan_threshold = 20;
 
-    if (argc > 1) {
-        packetFilter = argv[1];
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        auto next_value = [&](const char* flag) -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << "error: " << flag << " needs a value\n";
+                return nullptr;
+            }
+            return argv[++i];
+        };
+        if (arg == "-h" || arg == "--help") {
+            print_usage();
+            return 0;
+        } else if (arg == "-i" || arg == "-r" || arg == "-c" || arg == "-b" || arg == "-o" || arg == "-t") {
+            const char* value = next_value(arg.c_str());
+            if (value == nullptr) {
+                return 1;
+            }
+            char* end = nullptr;
+            if (arg == "-i") {
+                device = value;
+            } else if (arg == "-r") {
+                read_file = value;
+            } else if (arg == "-b") {
+                options.bpf = value;
+            } else if (arg == "-o") {
+                log_path = value;
+            } else {
+                const long n = std::strtol(value, &end, 10);
+                if (*value == '\0' || *end != '\0' || n < 0) {
+                    std::cerr << "error: " << arg << " needs a non-negative number\n";
+                    return 1;
+                }
+                if (arg == "-c") {
+                    options.max_packets = n;
+                } else {
+                    scan_threshold = static_cast<std::size_t>(n);
+                }
+            }
+        } else if (!arg.empty() && arg[0] != '-') {
+            filter_name = arg;
+        } else {
+            std::cerr << "error: unknown option " << arg << "\n";
+            print_usage();
+            return 1;
+        }
     }
 
-    if (packetFilter != "all" &&
-        packetFilter != "tcp" &&
-        packetFilter != "udp" &&
-        packetFilter != "icmp" &&
-        packetFilter != "icmpv6" &&
-        packetFilter != "ipv4" &&
-        packetFilter != "ipv6" &&
-        packetFilter != "other") {
-        printUsage();
+    ps::DisplayFilter filter;
+    if (!ps::DisplayFilter::parse(filter_name, filter)) {
+        std::cerr << "error: unknown filter '" << filter_name << "'\n";
+        print_usage();
         return 1;
     }
 
-    logFile.open("capture.log");
-
-    pcap_t* handle = pcap_open_live(
-        device,
-        BUFSIZ,
-        1,
-        1000,
-        errorBuffer
-    );
-
-    if (handle == nullptr) {
-        std::cerr << "Could not open device "
-                  << device
-                  << ": "
-                  << errorBuffer
-                  << std::endl;
-        return 1;
+    char error[PCAP_ERRBUF_SIZE];
+    pcap_t* handle = nullptr;
+    if (!read_file.empty()) {
+        handle = pcap_open_offline(read_file.c_str(), error);
+        if (handle == nullptr) {
+            std::cerr << "Could not open " << read_file << ": " << error << "\n";
+            return 1;
+        }
+        std::cout << "PacketScope - reading " << read_file << "\n";
+    } else {
+        if (device.empty()) {
+            device = default_device();
+        }
+        handle = pcap_open_live(device.c_str(), 65535, 1, 1000, error);
+        if (handle == nullptr) {
+            std::cerr << "Could not open device " << device << ": " << error << "\n";
+            return 1;
+        }
+        std::cout << "PacketScope - live capture on " << device << " (Ctrl+C to stop)\n";
+        std::signal(SIGINT, on_signal);
     }
 
-    std::cout << "PacketScope - Live Network Traffic Analyzer" << std::endl;
-    std::cout << "Capturing packets on interface: " << device << std::endl;
-    std::cout << "Active filter: " << packetFilter << std::endl;
-    std::cout << "Logging packets to capture.log" << std::endl;
-    std::cout << "Capturing 100 packets...\n" << std::endl;
+    std::ofstream log;
+    if (log_path != "none") {
+        log.open(log_path);
+        if (!log) {
+            std::cerr << "warning: could not open log file " << log_path << "; continuing without a log\n";
+        } else {
+            std::cout << "Logging printed packets to " << log_path << "\n";
+        }
+    }
+    std::cout << "Display filter: " << filter.name() << "\n\n";
 
-    pcap_loop(handle, 100, packetHandler, nullptr);
-
+    ps::TrafficAnalyzer analyzer(scan_threshold);
+    const ps::CaptureResult result =
+        ps::run_capture(handle, options, filter, analyzer, std::cout, log.is_open() ? &log : nullptr, &g_stop);
     pcap_close(handle);
 
-    std::cout << "\nCapture complete." << std::endl;
-
-    printTrafficSummary();
-    printTopConnections();
-
-    if (logFile.is_open()) {
-        logFile.close();
+    if (!result.ok) {
+        std::cerr << "error: " << result.error << "\n";
+        return 1;
     }
 
+    std::cout << "\nCapture complete.\n"
+              << ps::format_summary(analyzer, filter.name()) << ps::format_top_connections(analyzer, 5)
+              << ps::format_top_ports(analyzer, 5) << ps::format_scan_alerts(analyzer);
     return 0;
 }
